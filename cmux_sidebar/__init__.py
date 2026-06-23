@@ -1,3 +1,3 @@
-"""cmux_sidebar - Code Puppy plugin that reports agent activity to the cmux sidebar."""
+"""cmux_sidebar - Code Puppy plugin: live agent dashboard in the cmux sidebar."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

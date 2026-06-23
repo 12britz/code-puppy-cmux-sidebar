@@ -1,14 +1,27 @@
-"""cmux sidebar reporter for Code Puppy.
+"""cmux sidebar dashboard for Code Puppy.
 
-A self-contained Code Puppy plugin that mirrors live agent activity into the
-cmux terminal sidebar: status pills, a progress bar, log entries, and a
-desktop notification on completion.
+A self-contained Code Puppy plugin that turns the cmux sidebar into a live
+dashboard of agent activity:
 
-Self-contained on purpose: everything lives in this single module with no
-sibling imports, so it works identically whether dropped in as a builtin,
-user (~/.code_puppy/plugins/), or project (<repo>/.code_puppy/plugins/) plugin.
+* an **activity pill** with per-tool icons + colors (read / write / shell /
+  search / delete / agent),
+* a **context-window pill** (token usage %, color-coded),
+* a **progress bar**,
+* **detailed log entries** that show the actual file / command / pattern,
+* a **run summary** on completion (duration, tool count, tokens, tok/s,
+  context %) plus a desktop notification and a screen flash.
+
+Self-contained on purpose: one module, no sibling imports, so it loads
+identically as a builtin, user (~/.code_puppy/plugins/), or project plugin.
+Enrichment data (run stats, context usage) is imported defensively -- if a
+given Code Puppy build doesn't expose it, that piece is simply skipped.
 
 No-ops cleanly when not running inside cmux.
+
+Env toggles:
+* ``CMUX_SIDEBAR_DISABLED=1`` -- turn the whole plugin off.
+* ``CMUX_SIDEBAR_QUIET=1``    -- suppress per-tool log spam (keep pills +
+  the end-of-run summary only).
 """
 
 from __future__ import annotations
@@ -16,27 +29,73 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from functools import lru_cache
 
 from code_puppy.callbacks import register_callback
 
 # --------------------------------------------------------------------------- #
-# cmux CLI wrapper (crash-proof, fire-and-forget)
+# Sidebar identifiers
 # --------------------------------------------------------------------------- #
-STATUS_KEY = "puppy"
+KEY_ACTIVITY = "pup"
+KEY_CONTEXT = "pup_ctx"
 LOG_SOURCE = "code-puppy"
 
+# Activity colors
 COLOR_THINKING = "#7C4DFF"
-COLOR_TOOL = "#2D9CDB"
 COLOR_DONE = "#4CAF50"
 COLOR_ERROR = "#EB5757"
 COLOR_IDLE = "#9E9E9E"
 
+# Per-tool palette
+COLOR_READ = "#2D9CDB"
+COLOR_WRITE = "#F2994A"
+COLOR_DELETE = "#EB5757"
+COLOR_SHELL = "#9B51E0"
+COLOR_SEARCH = "#56CCF2"
+COLOR_AGENT = "#27AE60"
+COLOR_TOOL = "#2D9CDB"
 
+# Context %-buckets (match Code Puppy's own 30 / 65 indicator thresholds).
+CTX_GREEN = "#4CAF50"
+CTX_YELLOW = "#F2C94C"
+CTX_RED = "#EB5757"
+
+# tool_name -> (icon, color, (preferred arg keys...))
+_TOOL_META: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "read_file": ("eye", COLOR_READ, ("file_path",)),
+    "list_files": ("folder", COLOR_READ, ("directory", "path")),
+    "grep": ("magnifyingglass", COLOR_SEARCH, ("search_string", "pattern")),
+    "edit_file": ("pencil", COLOR_WRITE, ("file_path",)),
+    "create_file": ("plus.square", COLOR_WRITE, ("file_path",)),
+    "replace_in_file": ("pencil", COLOR_WRITE, ("file_path",)),
+    "delete_snippet": ("scissors", COLOR_WRITE, ("file_path",)),
+    "delete_file": ("trash", COLOR_DELETE, ("file_path",)),
+    "agent_run_shell_command": ("terminal", COLOR_SHELL, ("command",)),
+    "run_shell_command": ("terminal", COLOR_SHELL, ("command",)),
+    "invoke_agent": ("person.2", COLOR_AGENT, ("agent_name",)),
+    "list_agents": ("person.2", COLOR_AGENT, ()),
+}
+_DEFAULT_META = ("hammer", COLOR_TOOL, ("file_path", "command", "query", "name"))
+
+# Progress heuristic (we can't know the total tool count up front).
+_TOOL_STEP = 0.08
+_TOOL_CAP = 0.9
+
+
+# --------------------------------------------------------------------------- #
+# cmux CLI wrapper (crash-proof, fire-and-forget)
+# --------------------------------------------------------------------------- #
 @lru_cache(maxsize=1)
 def in_cmux() -> bool:
-    """True only when we're inside cmux and the CLI is callable."""
+    """True only when inside cmux, the CLI is callable, and not disabled."""
+    if os.environ.get("CMUX_SIDEBAR_DISABLED"):
+        return False
     return bool(os.environ.get("CMUX_WORKSPACE_ID")) and shutil.which("cmux") is not None
+
+
+def _quiet() -> bool:
+    return bool(os.environ.get("CMUX_SIDEBAR_QUIET"))
 
 
 def _run(args: list[str]) -> None:
@@ -54,15 +113,24 @@ def _run(args: list[str]) -> None:
         pass  # cosmetic feature: swallow everything
 
 
-def _set_status(value: str, icon: str, color: str) -> None:
-    _run(["set-status", STATUS_KEY, value, "--icon", icon, "--color", color])
+def _status(key: str, value: str, icon: str, color: str, priority: int = 0) -> None:
+    _run(
+        [
+            "set-status", key, value,
+            "--icon", icon, "--color", color, "--priority", str(priority),
+        ]
+    )
+
+
+def _clear_status(key: str) -> None:
+    _run(["clear-status", key])
 
 
 def _log(message: str, level: str = "info") -> None:
     _run(["log", "--level", level, "--source", LOG_SOURCE, "--", message])
 
 
-def _set_progress(value: float, label: str = "") -> None:
+def _progress(value: float, label: str = "") -> None:
     value = max(0.0, min(1.0, value))
     args = ["set-progress", f"{value:.2f}"]
     if label:
@@ -81,38 +149,143 @@ def _notify(title: str, body: str, subtitle: str = "") -> None:
     _run(args)
 
 
+def _flash() -> None:
+    surface = os.environ.get("CMUX_SURFACE_ID")
+    if surface:
+        _run(["trigger-flash", "--surface", surface])
+
+
+# --------------------------------------------------------------------------- #
+# Optional enrichment (defensive imports -- skipped if build lacks them)
+# --------------------------------------------------------------------------- #
+def _context_pct() -> float | None:
+    """Return context-window usage as a 0-100 percentage, or None."""
+    try:
+        from code_puppy.plugins.context_indicator.usage import get_current_usage
+
+        usage = get_current_usage()
+        if usage is None:
+            return None
+        return float(usage.percent)
+    except Exception:
+        return None
+
+
+def _cycle_stats() -> dict:
+    """Return last-cycle stats dict (model/gen_tps/output_tokens), or {}."""
+    try:
+        from code_puppy.agents.run_stats import AgentRunStats
+
+        return AgentRunStats.get_last_cycle_stats() or {}
+    except Exception:
+        return {}
+
+
+# --------------------------------------------------------------------------- #
+# Formatting helpers
+# --------------------------------------------------------------------------- #
+def _ctx_color(pct: float) -> str:
+    if pct < 30:
+        return CTX_GREEN
+    if pct < 65:
+        return CTX_YELLOW
+    return CTX_RED
+
+
+def _update_context_pill() -> None:
+    pct = _context_pct()
+    if pct is None:
+        return
+    _status(
+        KEY_CONTEXT, f"ctx {pct:.0f}%", "gauge", _ctx_color(pct), priority=60
+    )
+
+
+def _truncate(text: str, limit: int = 44) -> str:
+    text = " ".join(str(text).split())  # collapse whitespace/newlines
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def _arg_summary(tool_name: str, tool_args) -> str:
+    """Pull the most meaningful argument (file / command / pattern) for display."""
+    _, _, keys = _TOOL_META.get(tool_name, _DEFAULT_META)
+    if not isinstance(tool_args, dict):
+        return ""
+    for k in keys:
+        val = tool_args.get(k)
+        if val:
+            # For file paths, show just the basename to keep it tight.
+            if k == "file_path":
+                val = os.path.basename(str(val)) or str(val)
+            return _truncate(val)
+    return ""
+
+
+def _human_tokens(n: int) -> str:
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(int(n))
+
+
+def _fmt_summary(elapsed: float, tools: int) -> str:
+    parts = [f"{elapsed:.1f}s", f"{tools} tool{'s' if tools != 1 else ''}"]
+    stats = _cycle_stats()
+    out = int(stats.get("output_tokens") or 0)
+    tps = float(stats.get("gen_tps") or 0.0)
+    if out:
+        parts.append(f"{_human_tokens(out)} tok")
+    if tps:
+        parts.append(f"{tps:.0f} tok/s")
+    pct = _context_pct()
+    if pct is not None:
+        parts.append(f"ctx {pct:.0f}%")
+    return " \u00b7 ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Per-run state
+# --------------------------------------------------------------------------- #
+_state: dict[str, float] = {"tool_count": 0, "t0": 0.0}
+
+
 # --------------------------------------------------------------------------- #
 # Lifecycle -> sidebar mapping
 # --------------------------------------------------------------------------- #
-_TOOL_STEP = 0.08
-_TOOL_CAP = 0.9
-_state: dict[str, int] = {"tool_count": 0}
-
-
 def _on_startup() -> None:
-    if in_cmux():
-        _set_status("ready", "sparkle", COLOR_IDLE)
+    if not in_cmux():
+        return
+    _status(KEY_ACTIVITY, "ready", "sparkle", COLOR_IDLE, priority=70)
+    _update_context_pill()
 
 
 def _on_agent_run_start(agent_name: str, model_name: str, session_id=None) -> None:
     _state["tool_count"] = 0
-    _set_status("thinking...", "sparkle", COLOR_THINKING)
-    _set_progress(0.05, label=f"{agent_name} - {model_name}")
-    _log(f"Run started ({agent_name} / {model_name})", "info")
+    _state["t0"] = time.monotonic()
+    _status(KEY_ACTIVITY, "thinking", "sparkle", COLOR_THINKING, priority=70)
+    _progress(0.05, label=model_name or agent_name)
+    _update_context_pill()
+    if not _quiet():
+        _log(f"Run started ({agent_name} / {model_name})", "info")
 
 
-def _on_pre_tool_call(tool_name: str, tool_args: dict, context=None) -> None:
+def _on_pre_tool_call(tool_name: str, tool_args, context=None) -> None:
     _state["tool_count"] += 1
-    count = _state["tool_count"]
-    progress = min(0.05 + count * _TOOL_STEP, _TOOL_CAP)
-    _set_status(tool_name, "hammer", COLOR_TOOL)
-    _set_progress(progress, label=f"{tool_name} (#{count})")
-    _log(f"-> {tool_name}", "progress")
+    count = int(_state["tool_count"])
+    icon, color, _ = _TOOL_META.get(tool_name, _DEFAULT_META)
+    summary = _arg_summary(tool_name, tool_args)
+    pill = f"{tool_name}: {summary}" if summary else tool_name
+    _status(KEY_ACTIVITY, _truncate(pill, 36), icon, color, priority=70)
+    _progress(min(0.05 + count * _TOOL_STEP, _TOOL_CAP), label=f"{tool_name} (#{count})")
+    if not _quiet():
+        detail = f" {summary}" if summary else ""
+        _log(f"-> {tool_name}{detail}", "progress")
 
 
 def _on_post_tool_call(
-    tool_name: str, tool_args: dict, result=None, duration_ms: float = 0.0, context=None
+    tool_name: str, tool_args, result=None, duration_ms: float = 0.0, context=None
 ) -> None:
+    if _quiet():
+        return
     _log(f"   {tool_name} done in {duration_ms:.0f}ms", "info")
 
 
@@ -125,33 +298,55 @@ def _on_agent_run_end(
     response_text=None,
     metadata=None,
 ) -> None:
-    tools = _state.get("tool_count", 0)
+    elapsed = time.monotonic() - (_state.get("t0") or time.monotonic())
+    tools = int(_state.get("tool_count", 0))
+    summary = _fmt_summary(elapsed, tools)
+    _update_context_pill()
     if success:
-        _set_progress(1.0, label="Complete")
-        _set_status("done", "checkmark", COLOR_DONE)
-        _log(f"Run complete ({tools} tool calls)", "success")
-        _notify("Code Puppy", f"Task complete - {tools} tool call(s).", agent_name)
+        _progress(1.0, label="Complete")
+        _status(KEY_ACTIVITY, "done", "checkmark", COLOR_DONE, priority=70)
+        _log(f"Complete \u00b7 {summary}", "success")
+        _notify("Code Puppy", summary, agent_name)
     else:
-        _set_status("error", "xmark", COLOR_ERROR)
-        _log(f"Run failed: {error}", "error")
+        _status(KEY_ACTIVITY, "error", "xmark", COLOR_ERROR, priority=70)
+        _log(f"Failed: {error} \u00b7 {summary}", "error")
         _notify("Code Puppy", f"Run failed: {error}", agent_name)
+    _flash()
     _clear_progress()
 
 
 def _on_agent_run_cancel(group_id: str) -> None:
-    _set_status("cancelled", "xmark", COLOR_ERROR)
-    _log("Run cancelled", "warning")
+    elapsed = time.monotonic() - (_state.get("t0") or time.monotonic())
+    tools = int(_state.get("tool_count", 0))
+    _status(KEY_ACTIVITY, "cancelled", "xmark", COLOR_ERROR, priority=70)
+    _log(f"Cancelled \u00b7 {elapsed:.1f}s \u00b7 {tools} tools", "warning")
     _clear_progress()
 
 
+def _on_shutdown() -> None:
+    _clear_progress()
+    _clear_status(KEY_ACTIVITY)
+    _clear_status(KEY_CONTEXT)
+
+
+# --------------------------------------------------------------------------- #
+# Registration (dedup-guarded so accidental double-loads can't double-fire)
+# --------------------------------------------------------------------------- #
+_REGISTERED = False
+
+
 def register() -> None:
-    """Register all sidebar callbacks. Runs at import time (plugin loader)."""
+    global _REGISTERED
+    if _REGISTERED:
+        return
     register_callback("startup", _on_startup)
     register_callback("agent_run_start", _on_agent_run_start)
     register_callback("pre_tool_call", _on_pre_tool_call)
     register_callback("post_tool_call", _on_post_tool_call)
     register_callback("agent_run_end", _on_agent_run_end)
     register_callback("agent_run_cancel", _on_agent_run_cancel)
+    register_callback("shutdown", _on_shutdown)
+    _REGISTERED = True
 
 
 register()
