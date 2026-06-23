@@ -1,5 +1,10 @@
 # cmux sidebar for Code Puppy
 
+![cmux_sidebar demo](assets/demo.gif)
+
+> *Illustrative rendering of the sidebar states (not a screen capture).*
+
+
 A tiny, zero-dependency [Code Puppy](https://github.com/mpfaffenberger/code_puppy)
 plugin that turns the [cmux](https://cmux.io) sidebar into a **live dashboard**
 of agent activity.
