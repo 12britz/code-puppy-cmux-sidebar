@@ -78,6 +78,22 @@ _TOOL_META: dict[str, tuple[str, str, tuple[str, ...]]] = {
 }
 _DEFAULT_META = ("hammer", COLOR_TOOL, ("file_path", "command", "query", "name"))
 
+# tool_name -> short category label (for the end-of-run breakdown).
+_TOOL_CATEGORY: dict[str, str] = {
+    "read_file": "read",
+    "list_files": "read",
+    "grep": "search",
+    "edit_file": "edit",
+    "create_file": "edit",
+    "replace_in_file": "edit",
+    "delete_snippet": "edit",
+    "delete_file": "edit",
+    "agent_run_shell_command": "shell",
+    "run_shell_command": "shell",
+    "invoke_agent": "agent",
+    "list_agents": "agent",
+}
+
 # Progress heuristic (we can't know the total tool count up front).
 _TOOL_STEP = 0.08
 _TOOL_CAP = 0.9
@@ -181,6 +197,18 @@ def _cycle_stats() -> dict:
         return {}
 
 
+def _subagent() -> str | None:
+    """Return the active sub-agent name if a tool is running inside one."""
+    try:
+        from code_puppy.tools.subagent_context import get_subagent_name, is_subagent
+
+        if is_subagent():
+            return get_subagent_name() or "subagent"
+    except Exception:
+        pass
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
@@ -227,6 +255,15 @@ def _human_tokens(n: int) -> str:
     return str(int(n))
 
 
+def _fmt_breakdown() -> str:
+    """Compact per-category tool breakdown, e.g. '2 read - 1 edit - 1 shell'."""
+    if not _cats:
+        return ""
+    order = ["read", "search", "edit", "shell", "agent", "other"]
+    parts = [f"{_cats[c]} {c}" for c in order if _cats.get(c)]
+    return " \u00b7 ".join(parts)
+
+
 def _fmt_summary(elapsed: float, tools: int) -> str:
     parts = [f"{elapsed:.1f}s", f"{tools} tool{'s' if tools != 1 else ''}"]
     stats = _cycle_stats()
@@ -246,6 +283,7 @@ def _fmt_summary(elapsed: float, tools: int) -> str:
 # Per-run state
 # --------------------------------------------------------------------------- #
 _state: dict[str, float] = {"tool_count": 0, "t0": 0.0}
+_cats: dict[str, int] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +299,7 @@ def _on_startup() -> None:
 def _on_agent_run_start(agent_name: str, model_name: str, session_id=None) -> None:
     _state["tool_count"] = 0
     _state["t0"] = time.monotonic()
+    _cats.clear()
     _status(KEY_ACTIVITY, "thinking", "sparkle", COLOR_THINKING, priority=70)
     _progress(0.05, label=model_name or agent_name)
     _update_context_pill()
@@ -271,14 +310,22 @@ def _on_agent_run_start(agent_name: str, model_name: str, session_id=None) -> No
 def _on_pre_tool_call(tool_name: str, tool_args, context=None) -> None:
     _state["tool_count"] += 1
     count = int(_state["tool_count"])
+    _cats[_TOOL_CATEGORY.get(tool_name, "other")] = (
+        _cats.get(_TOOL_CATEGORY.get(tool_name, "other"), 0) + 1
+    )
     icon, color, _ = _TOOL_META.get(tool_name, _DEFAULT_META)
     summary = _arg_summary(tool_name, tool_args)
-    pill = f"{tool_name}: {summary}" if summary else tool_name
-    _status(KEY_ACTIVITY, _truncate(pill, 36), icon, color, priority=70)
+    sub = _subagent()
+    prefix = f"[{sub}] " if sub else ""
+    pill = f"{prefix}{tool_name}: {summary}" if summary else f"{prefix}{tool_name}"
+    # Sub-agent activity gets the green agent color to stand out.
+    pill_color = COLOR_AGENT if sub else color
+    _status(KEY_ACTIVITY, _truncate(pill, 36), icon, pill_color, priority=70)
     _progress(min(0.05 + count * _TOOL_STEP, _TOOL_CAP), label=f"{tool_name} (#{count})")
+    _update_context_pill()  # live context tracking per tool
     if not _quiet():
         detail = f" {summary}" if summary else ""
-        _log(f"-> {tool_name}{detail}", "progress")
+        _log(f"-> {prefix}{tool_name}{detail}", "progress")
 
 
 def _on_post_tool_call(
@@ -301,11 +348,14 @@ def _on_agent_run_end(
     elapsed = time.monotonic() - (_state.get("t0") or time.monotonic())
     tools = int(_state.get("tool_count", 0))
     summary = _fmt_summary(elapsed, tools)
+    breakdown = _fmt_breakdown()
     _update_context_pill()
     if success:
         _progress(1.0, label="Complete")
         _status(KEY_ACTIVITY, "done", "checkmark", COLOR_DONE, priority=70)
         _log(f"Complete \u00b7 {summary}", "success")
+        if breakdown:
+            _log(f"Tools: {breakdown}", "info")
         _notify("Code Puppy", summary, agent_name)
     else:
         _status(KEY_ACTIVITY, "error", "xmark", COLOR_ERROR, priority=70)

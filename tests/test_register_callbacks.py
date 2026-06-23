@@ -100,6 +100,29 @@ def test_human_tokens(mod):
     assert mod._human_tokens(1500) == "1.5k"
 
 
+def test_breakdown_and_counts(mod):
+    mod._cats.clear()
+    mod._cats.update({"read": 2, "edit": 1, "shell": 1})
+    # ordered: read, search, edit, shell, agent, other
+    assert mod._fmt_breakdown() == "2 read \u00b7 1 edit \u00b7 1 shell"
+
+
+def test_breakdown_empty(mod):
+    mod._cats.clear()
+    assert mod._fmt_breakdown() == ""
+
+
+def test_category_counting(mod, monkeypatch):
+    monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+    mod.in_cmux.cache_clear()
+    mod._on_agent_run_start("B", "m")
+    mod._on_pre_tool_call("read_file", {"file_path": "a.py"})
+    mod._on_pre_tool_call("grep", {"search_string": "x"})
+    mod._on_pre_tool_call("edit_file", {"file_path": "a.py"})
+    mod._on_pre_tool_call("weird_unknown_tool", {})
+    assert mod._cats == {"read": 1, "search": 1, "edit": 1, "other": 1}
+
+
 def test_handlers_never_raise(mod, monkeypatch):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     mod.in_cmux.cache_clear()
