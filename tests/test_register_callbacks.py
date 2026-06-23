@@ -134,6 +134,25 @@ def test_task_handler_returns_none(mod, monkeypatch):
     assert any("set-status" in c and mod.KEY_TASK in c for c in calls)
 
 
+def test_files_touched(mod, monkeypatch):
+    monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+    mod.in_cmux.cache_clear()
+    mod._on_agent_run_start("B", "m")
+    mod._on_pre_tool_call("read_file", {"file_path": "/x/read_only.py"})  # not a write
+    mod._on_pre_tool_call("create_file", {"file_path": "/x/a.py"})
+    mod._on_pre_tool_call("edit_file", {"file_path": "/x/b.py"})
+    mod._on_pre_tool_call("edit_file", {"file_path": "/x/b.py"})  # dedup
+    mod._on_pre_tool_call("delete_file", {"file_path": "/x/c.py"})
+    assert mod._files == ["a.py", "b.py", "c.py"]  # read_only.py excluded, b deduped
+    assert mod._fmt_files() == "a.py, b.py, c.py"
+
+
+def test_files_overflow(mod):
+    mod._files.clear()
+    mod._files.extend(["a", "b", "c", "d", "e", "f"])
+    assert mod._fmt_files(limit=4) == "a, b, c, d (+2 more)"
+
+
 def test_handlers_never_raise(mod, monkeypatch):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     mod.in_cmux.cache_clear()

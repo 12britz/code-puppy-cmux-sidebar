@@ -257,6 +257,18 @@ def _human_tokens(n: int) -> str:
     return str(int(n))
 
 
+def _fmt_files(limit: int = 4) -> str:
+    """Compact list of files touched this run, e.g. 'auth.py, main.py (+2 more)'."""
+    if not _files:
+        return ""
+    shown = _files[:limit]
+    extra = len(_files) - len(shown)
+    text = ", ".join(shown)
+    if extra > 0:
+        text += f" (+{extra} more)"
+    return text
+
+
 def _fmt_breakdown() -> str:
     """Compact per-category tool breakdown, e.g. '2 read - 1 edit - 1 shell'."""
     if not _cats:
@@ -286,6 +298,12 @@ def _fmt_summary(elapsed: float, tools: int) -> str:
 # --------------------------------------------------------------------------- #
 _state: dict[str, float] = {"tool_count": 0, "t0": 0.0}
 _cats: dict[str, int] = {}
+_files: list[str] = []
+
+# Tools whose file_path counts as a "touched" (mutated) file.
+_WRITE_TOOLS = frozenset(
+    {"edit_file", "create_file", "replace_in_file", "delete_file", "delete_snippet"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -319,6 +337,7 @@ def _on_agent_run_start(agent_name: str, model_name: str, session_id=None) -> No
     _state["tool_count"] = 0
     _state["t0"] = time.monotonic()
     _cats.clear()
+    _files.clear()
     _status(KEY_ACTIVITY, "thinking", "sparkle", COLOR_THINKING, priority=70)
     _progress(0.05, label=model_name or agent_name)
     _update_context_pill()
@@ -342,6 +361,13 @@ def _on_pre_tool_call(tool_name: str, tool_args, context=None) -> None:
     _status(KEY_ACTIVITY, _truncate(pill, 36), icon, pill_color, priority=70)
     _progress(min(0.05 + count * _TOOL_STEP, _TOOL_CAP), label=f"{tool_name} (#{count})")
     _update_context_pill()  # live context tracking per tool
+    # Track touched (mutated) files for the end-of-run summary.
+    if tool_name in _WRITE_TOOLS and isinstance(tool_args, dict):
+        fp = tool_args.get("file_path")
+        if fp:
+            name = os.path.basename(str(fp)) or str(fp)
+            if name not in _files:
+                _files.append(name)
     if not _quiet():
         detail = f" {summary}" if summary else ""
         _log(f"-> {prefix}{tool_name}{detail}", "progress")
@@ -375,6 +401,9 @@ def _on_agent_run_end(
         _log(f"Complete \u00b7 {summary}", "success")
         if breakdown:
             _log(f"Tools: {breakdown}", "info")
+        files = _fmt_files()
+        if files:
+            _log(f"Files: {files}", "info")
         _notify("Code Puppy", summary, agent_name)
     else:
         _status(KEY_ACTIVITY, "error", "xmark", COLOR_ERROR, priority=70)
