@@ -40,6 +40,7 @@ from code_puppy.callbacks import register_callback
 KEY_ACTIVITY = "pup"
 KEY_CONTEXT = "pup_ctx"
 KEY_TASK = "pup_task"
+KEY_SAY = "pup_say"
 LOG_SOURCE = "code-puppy"
 
 # Activity colors
@@ -48,6 +49,11 @@ COLOR_DONE = "#4CAF50"
 COLOR_ERROR = "#EB5757"
 COLOR_IDLE = "#9E9E9E"
 COLOR_TASK = "#4F8EF7"
+COLOR_SAY = "#00BFA5"
+
+# How often (seconds) the live narration pill may update, to avoid spawning a
+# cmux subprocess per streamed token.
+_SAY_THROTTLE = 0.6
 
 # Per-tool palette
 COLOR_READ = "#2D9CDB"
@@ -211,6 +217,27 @@ def _subagent() -> str | None:
     return None
 
 
+def _stream_text(event_type: str, event_data) -> str:
+    """Pull any text/thinking content out of a streaming event, defensively.
+
+    Mirrors how Code Puppy's own run-stats reads stream events, but without
+    importing pydantic-ai types -- we just duck-type ``.content`` /
+    ``.content_delta``.
+    """
+    if not isinstance(event_data, dict):
+        return ""
+    try:
+        if event_type == "part_start":
+            part = event_data.get("part")
+            return str(getattr(part, "content", "") or "")
+        if event_type == "part_delta":
+            delta = event_data.get("delta")
+            return str(getattr(delta, "content_delta", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
 # --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
@@ -299,6 +326,7 @@ def _fmt_summary(elapsed: float, tools: int) -> str:
 _state: dict[str, float] = {"tool_count": 0, "t0": 0.0}
 _cats: dict[str, int] = {}
 _files: list[str] = []
+_say: dict[str, object] = {"buf": "", "last_push": 0.0, "last_text": ""}
 
 # Tools whose file_path counts as a "touched" (mutated) file.
 _WRITE_TOOLS = frozenset(
@@ -338,11 +366,38 @@ def _on_agent_run_start(agent_name: str, model_name: str, session_id=None) -> No
     _state["t0"] = time.monotonic()
     _cats.clear()
     _files.clear()
+    _say["buf"] = ""
+    _say["last_push"] = 0.0
+    _say["last_text"] = ""
     _status(KEY_ACTIVITY, "thinking", "sparkle", COLOR_THINKING, priority=70)
     _progress(0.05, label=model_name or agent_name)
     _update_context_pill()
     if not _quiet():
         _log(f"Run started ({agent_name} / {model_name})", "info")
+
+
+def _on_stream_event(event_type, event_data, agent_session_id=None) -> None:
+    """Live one-liner of what the agent is currently saying/thinking."""
+    if not in_cmux():
+        return
+    chunk = _stream_text(event_type, event_data)
+    if not chunk:
+        return
+    buf = (str(_say.get("buf", "")) + chunk)[-400:]  # keep a rolling tail
+    _say["buf"] = buf
+    now = time.monotonic()
+    if now - float(_say.get("last_push", 0.0)) < _SAY_THROTTLE:
+        return
+    # Show the most recent words (tail of the collapsed text).
+    flat = " ".join(buf.split())
+    if not flat:
+        return
+    tail = flat[-44:]
+    if tail == _say.get("last_text"):
+        return
+    _say["last_push"] = now
+    _say["last_text"] = tail
+    _status(KEY_SAY, tail, "quote.bubble", COLOR_SAY, priority=80)
 
 
 def _on_pre_tool_call(tool_name: str, tool_args, context=None) -> None:
@@ -411,6 +466,7 @@ def _on_agent_run_end(
         _notify("Code Puppy", f"Run failed: {error}", agent_name)
     _flash()
     _clear_progress()
+    _clear_status(KEY_SAY)
 
 
 def _on_agent_run_cancel(group_id: str) -> None:
@@ -419,6 +475,7 @@ def _on_agent_run_cancel(group_id: str) -> None:
     _status(KEY_ACTIVITY, "cancelled", "xmark", COLOR_ERROR, priority=70)
     _log(f"Cancelled \u00b7 {elapsed:.1f}s \u00b7 {tools} tools", "warning")
     _clear_progress()
+    _clear_status(KEY_SAY)
 
 
 def _on_shutdown() -> None:
@@ -426,6 +483,7 @@ def _on_shutdown() -> None:
     _clear_status(KEY_ACTIVITY)
     _clear_status(KEY_CONTEXT)
     _clear_status(KEY_TASK)
+    _clear_status(KEY_SAY)
 
 
 # --------------------------------------------------------------------------- #
@@ -441,6 +499,7 @@ def register() -> None:
     register_callback("startup", _on_startup)
     register_callback("user_prompt_submit", _on_user_prompt_submit)
     register_callback("agent_run_start", _on_agent_run_start)
+    register_callback("stream_event", _on_stream_event)
     register_callback("pre_tool_call", _on_pre_tool_call)
     register_callback("post_tool_call", _on_post_tool_call)
     register_callback("agent_run_end", _on_agent_run_end)

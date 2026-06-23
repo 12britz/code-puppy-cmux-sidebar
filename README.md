@@ -9,11 +9,12 @@ cmux**, so it's safe to leave installed everywhere.
 
 ## What you get
 
-**Three status pills** (color-coded, priority-sorted):
+**Four status pills** (color-coded, priority-sorted):
 
 | Pill | Shows |
 |---|---|
 | `pup_task` | a **one-liner of the task** you asked for (your prompt) |
+| `pup_say` | a **live one-liner of what the agent is saying/thinking** (streamed, throttled) |
 | `pup` | current activity with a **per-tool icon + color** and the actual target (file / command / pattern) |
 | `pup_ctx` | **context-window usage %** -- green `<30%`, yellow `<65%`, red `>=65%` |
 
@@ -96,8 +97,9 @@ plugin is a single self-contained module (no sibling imports) so it loads
 identically as a builtin, user, or project plugin, with a dedup guard so an
 accidental double-load can't double-fire.
 
-Hooks used: `startup`, `user_prompt_submit`, `agent_run_start`, `pre_tool_call`,
-`post_tool_call`, `agent_run_end`, `agent_run_cancel`, `shutdown`.
+Hooks used: `startup`, `user_prompt_submit`, `agent_run_start`, `stream_event`,
+`pre_tool_call`, `post_tool_call`, `agent_run_end`, `agent_run_cancel`,
+`shutdown`.
 
 ## License
 

@@ -153,12 +153,47 @@ def test_files_overflow(mod):
     assert mod._fmt_files(limit=4) == "a, b, c, d (+2 more)"
 
 
+def test_stream_text_extract(mod):
+    class P:
+        content = "hello world"
+
+    class D:
+        content_delta = " more"
+
+    assert mod._stream_text("part_start", {"part": P()}) == "hello world"
+    assert mod._stream_text("part_delta", {"delta": D()}) == " more"
+    assert mod._stream_text("other", {"x": 1}) == ""
+    assert mod._stream_text("part_start", "not-a-dict") == ""
+
+
+def test_narration_pill_throttled(mod, monkeypatch):
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws")
+    monkeypatch.setattr(mod.shutil, "which", lambda _: "/usr/bin/cmux")
+    mod.in_cmux.cache_clear()
+    mod._say["buf"] = ""
+    mod._say["last_push"] = 0.0
+    mod._say["last_text"] = ""
+    calls = _capture(mod, monkeypatch)
+
+    class D:
+        content_delta = "analyzing the codebase now"
+
+    mod._on_stream_event("part_delta", {"delta": D()})
+    # first push sets the say pill
+    assert any("set-status" in c and mod.KEY_SAY in c for c in calls)
+    calls.clear()
+    # immediate second event is throttled (no new push)
+    mod._on_stream_event("part_delta", {"delta": D()})
+    assert not any(mod.KEY_SAY in c for c in calls)
+
+
 def test_handlers_never_raise(mod, monkeypatch):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     mod.in_cmux.cache_clear()
     mod._on_startup()
     mod._on_user_prompt_submit("do the thing")
     mod._on_agent_run_start("B", "some-model")
+    mod._on_stream_event("part_delta", {"delta": object()})
     mod._on_pre_tool_call("edit_file", {"file_path": "/x/y.py"})
     mod._on_post_tool_call("edit_file", {}, None, 12.0)
     mod._on_agent_run_end("B", "some-model", success=True)
