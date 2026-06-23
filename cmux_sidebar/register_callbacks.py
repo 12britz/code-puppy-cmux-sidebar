@@ -39,6 +39,7 @@ from code_puppy.callbacks import register_callback
 # --------------------------------------------------------------------------- #
 KEY_ACTIVITY = "pup"
 KEY_CONTEXT = "pup_ctx"
+KEY_TASK = "pup_task"
 LOG_SOURCE = "code-puppy"
 
 # Activity colors
@@ -46,6 +47,7 @@ COLOR_THINKING = "#7C4DFF"
 COLOR_DONE = "#4CAF50"
 COLOR_ERROR = "#EB5757"
 COLOR_IDLE = "#9E9E9E"
+COLOR_TASK = "#4F8EF7"
 
 # Per-tool palette
 COLOR_READ = "#2D9CDB"
@@ -296,6 +298,23 @@ def _on_startup() -> None:
     _update_context_pill()
 
 
+def _on_user_prompt_submit(prompt: str, session_id=None):
+    """Show a one-liner of the task the agent is about to work on.
+
+    MUST return None so we never modify the user's prompt -- this hook can
+    rewrite prompts, and we only want to *observe* it.
+    """
+    try:
+        task = _truncate(prompt or "", 50)
+        if task:
+            _status(KEY_TASK, task, "list.bullet", COLOR_TASK, priority=90)
+            if not _quiet():
+                _log(f"Task: {task}", "info")
+    except Exception:
+        pass
+    return None
+
+
 def _on_agent_run_start(agent_name: str, model_name: str, session_id=None) -> None:
     _state["tool_count"] = 0
     _state["t0"] = time.monotonic()
@@ -377,6 +396,7 @@ def _on_shutdown() -> None:
     _clear_progress()
     _clear_status(KEY_ACTIVITY)
     _clear_status(KEY_CONTEXT)
+    _clear_status(KEY_TASK)
 
 
 # --------------------------------------------------------------------------- #
@@ -390,6 +410,7 @@ def register() -> None:
     if _REGISTERED:
         return
     register_callback("startup", _on_startup)
+    register_callback("user_prompt_submit", _on_user_prompt_submit)
     register_callback("agent_run_start", _on_agent_run_start)
     register_callback("pre_tool_call", _on_pre_tool_call)
     register_callback("post_tool_call", _on_post_tool_call)

@@ -123,10 +123,22 @@ def test_category_counting(mod, monkeypatch):
     assert mod._cats == {"read": 1, "search": 1, "edit": 1, "other": 1}
 
 
+def test_task_handler_returns_none(mod, monkeypatch):
+    # Critical: must NOT modify the user's prompt -> always returns None.
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws")
+    monkeypatch.setattr(mod.shutil, "which", lambda _: "/usr/bin/cmux")
+    mod.in_cmux.cache_clear()
+    calls = _capture(mod, monkeypatch)
+    assert mod._on_user_prompt_submit("build me a thing") is None
+    # a task pill was set
+    assert any("set-status" in c and mod.KEY_TASK in c for c in calls)
+
+
 def test_handlers_never_raise(mod, monkeypatch):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     mod.in_cmux.cache_clear()
     mod._on_startup()
+    mod._on_user_prompt_submit("do the thing")
     mod._on_agent_run_start("B", "some-model")
     mod._on_pre_tool_call("edit_file", {"file_path": "/x/y.py"})
     mod._on_post_tool_call("edit_file", {}, None, 12.0)
